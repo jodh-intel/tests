@@ -21,6 +21,8 @@
 # - spot any stuck or non-started components
 # - catch any hang ups
 
+script_name=${0##*/}
+
 # How many times will we run the test loop...
 ITERATIONS=5
 
@@ -55,8 +57,69 @@ VC_POD_DIR="${VC_POD_DIR:-/var/lib/virtcontainers/pods}"
 # then just set this to a very large number
 MAX_CONTAINERS=110
 
-function count_containers() {
-	docker ps -qa | wc -l
+containerd="docker-containerd"
+ctr="docker-containerd-ctr"
+
+MANAGER="${MANAGER:-${docker}}"
+
+function die() {
+	msg="$*"
+	echo >&2 "ERROR: $msg"
+	exit 1
+}
+
+function docker_run() {
+	local runtime="$1"
+	local payload="$2"
+	local command="$3"
+
+	docker run --runtime=${runtime} -tid ${payload} ${command}
+}
+
+function containerd_run() {
+	local runtime="$1"
+	local payload="$2"
+	local command="$3"
+
+	local id=$(uuidgen)
+
+	# copy the bundle dir for this container
+	bundle_dir="/tmp/${id}-bundle-dir"
+	sudo cp -a "$containerd_bundle_dir" "$bundle_dir"
+
+	# FIXME: runtime path, redirect, background.
+	sudo "$ctr" containers start \
+		--runtime "$runtime" \
+		"$id" \
+		"$bundle_dir" &
+}
+
+function manager_run() {
+	func="${MANAGER}_run"
+	run_func "$func" $@
+}
+
+function docker_get_containers() {
+	docker ps -qa
+}
+
+function docker_count_containers() {
+	docker_get_containers | wc -l
+}
+
+function containerd_get_containers() {
+	# FIXME: uncomment once the runtime supports "ps"!!
+	#sudo "$ctr" containers list
+	sudo cc-runtime list | awk '{print $1}'| tail -n +2
+}
+
+function containerd_count_containers() {
+	containerd_get_containers | wc -l
+}
+
+function manager_count_containers() {
+	func="${MANAGER}_count_containers"
+	run_func "$func" $@
 }
 
 function check_all_running() {
@@ -64,8 +127,8 @@ function check_all_running() {
 
 	echo "Checking ${how_many} containers have all relevant components"
 
-	# check what docker thinks
-	how_many_running=$(count_containers)
+	# check what the container manager thinks
+	how_many_running=$(manager_count_containers)
 
 	if (( ${how_many_running} != ${how_many} )); then
 		echo "Wrong number of containers running (${how_many_running} != ${how_many}) - stopping"
@@ -151,7 +214,7 @@ function go() {
 		check_all_running
 
 		echo "Run $RUNTIME: $PAYLOAD: $COMMAND"
-		docker run --runtime=${RUNTIME} -tid ${PAYLOAD} ${COMMAND}
+		manager_run "${RUNTIME}" "${PAYLOAD}" "${COMMAND}"
 
 		((how_many++))
 		if (( ${how_many} > ${MAX_CONTAINERS} )); then
@@ -168,11 +231,36 @@ function go() {
 	done
 }
 
-function kill_all_containers() {
-	present=$(docker ps -qa | wc -l)
-	if ((${present})); then
-		docker rm -f $(docker ps -qa)
-	fi
+function docker_kill_all_containers() {
+	for container in $(docker_get_containers)
+	do
+		docker rm -f "$container"
+	done
+}
+
+function containerd_kill_all_containers() {
+	for container in $(containerd_get_containers)
+	do
+		sudo "$ctr" containers kill "$container"
+	done
+}
+
+function manager_kill_all_containers() {
+	func="${MANAGER}_kill_all_containers"
+	run_func "$func"
+}
+
+function check_function() {
+	local name="$1"
+
+	type -t "$name" &>/dev/null || die "function '$name' does not exist"
+}
+
+function run_func() {
+	name="$1"
+	shift
+
+	check_function "$name" && eval "$name" $@
 }
 
 function count_mounts() {
@@ -187,8 +275,65 @@ function check_mounts() {
 	fi
 }
 
+function manager_setup() {
+	case "$MANAGER" in
+		docker) ;;
+		containerd)
+			command -v containerd && containerd="containerd"
+			command -v ctr && ctr="ctr"
+			;;
+
+
+		*)
+			die "unsupported container manager: $MANAGER"
+			;;
+	esac
+
+	#if [ "$manager" = docker ]; then
+	#	sudo systemctl restart docker 
+	#else
+	#	sudo systemctl stop docker 
+	#fi
+
+	if [ "$MANAGER" = containerd ]; then
+		command -v docker-containerd-shim || \
+			sudo ln -s /usr/bin/docker-containerd-shim /usr/local/bin/containerd-shim
+
+		# FIXME
+		command -v runc || \
+			sudo ln -s /usr/bin/docker-runc /usr/local/bin/runc
+
+		# create payload from the docker image
+		containerd_bundle_dir=$(mktemp -d /tmp/${script_name}.XXXXXXXXXX)
+		containerd_rootfs_dir="$containerd_bundle_dir/rootfs"
+		mkdir -p "$containerd_rootfs_dir"
+
+		docker export $(docker create "$PAYLOAD") |\
+			tar -C ${containerd_rootfs_dir} -xvf -
+
+		# FIXME: what is changing config.json?
+		#cd "$containerd_bundle_dir" && runc spec  && sudo chmod 444 config.json)
+		(cd "$containerd_bundle_dir" && docker-runc spec)
+
+		# FIXME: not deleted atm
+		echo "DEBUG: containerd bundle directory: $containerd_bundle_dir"
+
+		sudo "$containerd" --debug &
+
+		# wait for the daemon to start up
+		while [ 1 ]
+		do
+			echo "waiting for $containerd daemon"
+			sudo docker-containerd-ctr version && break
+		done
+	else
+		sudo killall -9 "$containerd"
+	fi
+}
+
 function init() {
-	kill_all_containers
+	manager_setup
+	manager_kill_all_containers
 
 	# remember how many mount points we had before we do anything
 	# and then sanity check we end up with no new ones dangling at the end
@@ -212,7 +357,7 @@ function spin() {
 		#check we are in a sane state
 		check_all_running
 		#shut them all down
-		kill_all_containers
+		manager_kill_all_containers
 		#Note there should be none running
 		how_many=0
 		#and check they all died
